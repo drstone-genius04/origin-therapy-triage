@@ -25,7 +25,22 @@ npm run validate -- --input data/inbox.json --output output.json --trace .trace/
 
 **Important:** `npm run validate` expects a fresh audit trace. Run `npm run triage` first (or use `npm run check`). The `.trace/` directory is generated locally and is not committed.
 
-End-to-end runtime for all eight items is under one second on a typical laptop.
+**Optional LLM safeguarding** (recommended for full behavior on item_2):
+
+```bash
+export ANTHROPIC_API_KEY=your_key_here
+npm run check
+```
+
+Or place the key in a local `.env` file (gitignored) and load it before triage:
+
+```bash
+set -a && source .env && set +a && npm run check
+```
+
+Without `ANTHROPIC_API_KEY`, triage falls back to keyword rules only and still passes validation.
+
+Runtime: under one second without LLM; roughly two to three seconds with LLM enabled (eight parallel Haiku calls).
 
 ## Stack and runtime
 
@@ -34,14 +49,16 @@ End-to-end runtime for all eight items is under one second on a typical laptop.
 | Language | TypeScript on Node LTS |
 | Runner | `tsx` (no build step required) |
 | Validation | `ajv` against `schema/output.schema.json` |
-| Runtime LLM | None — classification, extraction, and workflows are rule-based |
-| New dependencies | None beyond the starter `package.json` |
+| Runtime LLM | Optional — Anthropic `claude-haiku-4-5-20251001` for safeguarding only ([`src/llm.ts`](src/llm.ts)) |
+| Added dependency | `@anthropic-ai/sdk` (safeguarding classifier) |
 
 **Assumptions**
 
 - Synthetic data only (`data/inbox.json`, `data/policies.md`, `data/providers.json`).
 - Tool behavior comes from the provided `src/tools.ts` mock layer; results are deterministic.
+- LLM calls are outside `src/tools.ts` and do not appear in `tools_called[]` or `.trace/`.
 - All items require human review before any outbound message is sent or appointment is scheduled.
+- API keys are read from `ANTHROPIC_API_KEY` only — never committed.
 
 **AI coding assistant used while building:** Cursor.
 
@@ -51,17 +68,27 @@ Each inbox item is triaged independently inside `withItemContext(item.id, ...)`.
 
 ```text
 InboxItem
-  → classify() / prioritize()     [src/classify.ts — priority stack for overlapping signals]
-  → extractIntake()               [regex + channel-specific patterns in src/agent.ts]
-  → workflow branch               [src/agent.ts — tool orchestration per scenario]
-  → buildOutput()                 [tools_called from getToolCallsForItem(); assertSafeDraft() on replies]
+  → assessSafeguarding()           [src/llm.ts — optional Anthropic; rules OR llm merge]
+  → classify() / prioritize()      [src/classify.ts — priority stack for overlapping signals]
+  → extractIntake()                [regex + channel-specific patterns in src/agent.ts]
+  → workflow branch                [src/agent.ts — tool orchestration per scenario]
+  → buildOutput()                  [tools_called from getToolCallsForItem(); assertSafeDraft() on replies]
 ```
+
+### Safeguarding merge policy (`src/llm.ts`)
+
+1. Keyword rules run first (`hasSafeguardingSignals` in `src/classify.ts`).
+2. If `ANTHROPIC_API_KEY` is set, a focused JSON classifier asks whether the message suggests harm, abuse, neglect, or unsafe caregiving.
+3. **Merge:** `is_safeguarding = rules OR llm` — keyword hits are never dropped; LLM improves recall on indirect wording.
+4. **Fallback:** missing key or API error → rules only; triage completes offline.
+
+When the LLM contributes, `decision_rationale` and `escalation.reason` note that fact for staff audit.
 
 ### Classification priority (`src/classify.ts`)
 
 Overlapping intents are resolved in fixed order (not first-keyword-wins):
 
-1. Safeguarding (P0)
+1. Safeguarding (P0) — from merged assessment above
 2. Same-day cancel / reschedule (P1; `existing_patient_request` when patient identifiable)
 3. Clinical question (tight phrase list — avoids bare `"is it"` false positives)
 4. New referral (fax, referral keyword, Spanish eval terms)
@@ -91,7 +118,7 @@ The trace file `.trace/tool-calls.jsonl` is the source of truth for tool audit; 
 
 ## Failure modes and production eval
 
-**Safeguarding recall.** P0 detection uses keyword and phrase rules (`rough`, `harm`, `unsafe`, etc.). Indirect or coded disclosures may be missed without a dedicated harm classifier (see “another 4 hours” below).
+**Safeguarding recall.** Keyword rules catch explicit signals (e.g. item_2 “getting rough”). The optional LLM layer adds interpretation of indirect harm language; without an API key, only rules run. Production would still want human-labeled eval on hidden variants.
 
 **Extraction on freeform voicemails.** Regex handles the provided transcripts reasonably (including Spanish `soy …` caller names), but messy or atypical speech would benefit from structured LLM extraction with validation.
 
@@ -101,7 +128,7 @@ The trace file `.trace/tool-calls.jsonl` is the source of truth for tool audit; 
 
 **What I would measure in production**
 
-- P0 recall / precision on labeled safeguarding messages
+- P0 recall / precision on labeled safeguarding messages (rules vs LLM vs both)
 - Classification and urgency accuracy vs clinician labels
 - Extraction F1 on child name, payer, discipline, contact
 - Tool appropriateness (justified calls, no performative lookups)
@@ -109,7 +136,7 @@ The trace file `.trace/tool-calls.jsonl` is the source of truth for tool audit; 
 
 ## What I chose not to build, and why
 
-- **Runtime LLM calls** — kept the pipeline deterministic, fast, and easy to audit for a two-hour scope; rules plus policy tools were sufficient for the visible inbox.
+- **LLM for full classification or extraction** — safeguarding-only scope keeps cost and audit surface small; regex handles structured referrals and the visible voicemails adequately.
 - **Multi-agent frameworks** — eight independent items do not need orchestration beyond a single agent module.
 - **Cross-item memory** — mock tools are stateless; no benefit for this batch.
 - **Auto-scheduling or send** — assignment constraints; only `hold_slot` and `draft_message` for human review.
@@ -117,10 +144,9 @@ The trace file `.trace/tool-calls.jsonl` is the source of truth for tool audit; 
 
 ## What I would do with another 4 hours
 
-1. **LLM safeguarding classifier** — focused Anthropic prompt for harm/abuse/neglect with rule-based fallback and merge (`rules OR model` for recall).
-2. **LLM structured extraction for voicemails only** — JSON matching `ExtractedIntake`, merged with regex fallback.
-3. **Small eval harness** — golden expectations for the eight visible items (classification, urgency, key tools, no forbidden holds).
-4. **P1 slot policy** — skip `hold_slot` when the earliest opening is not same-day; task front desk to call family instead.
-5. **Tighter `task_ids`** — list only `create_task` IDs; reference hold IDs in task notes only.
+1. **LLM structured extraction for voicemails only** — JSON matching `ExtractedIntake`, merged with regex fallback (e.g. caller name on item_2).
+2. **Small eval harness** — golden expectations for the eight visible items (classification, urgency, key tools, no forbidden holds).
+3. **P1 slot policy** — skip `hold_slot` when the earliest opening is not same-day; task front desk to call family instead.
+4. **Tighter `task_ids`** — list only `create_task` IDs; reference hold IDs in task notes only.
 
-Already implemented in this submission (not deferred): priority-based ambiguous classification (`src/classify.ts`), rule-based draft safety filter (`assertSafeDraft`), parent-aware draft routing, and `npm run check`.
+Already implemented in this submission: optional LLM safeguarding classifier with rules fallback ([`src/llm.ts`](src/llm.ts)), priority-based ambiguous classification ([`src/classify.ts`](src/classify.ts)), rule-based draft safety filter (`assertSafeDraft`), parent-aware draft routing, and `npm run check`.
