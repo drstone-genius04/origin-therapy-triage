@@ -99,7 +99,7 @@ Overlapping intents are resolved in fixed order (not first-keyword-wins):
 | Scenario | Tools (typical order) |
 |----------|------------------------|
 | Safeguarding | `lookup_policy` → `escalate` → `create_task` → `draft_message` |
-| Same-day cancellation | `lookup_policy` → `search_patient` → `find_slots` → `hold_slot` → `create_task` → `draft_message` |
+| Same-day cancellation | `lookup_policy` → `search_patient` → `find_slots` → (`hold_slot` only if slot within 3 days of `received_at`) → `create_task` → `draft_message` |
 | In-network referral | `verify_insurance` → (`lookup_policy` if Spanish) → `find_slots` → `hold_slot` → `create_task` → `draft_message` |
 | Out-of-network referral | `verify_insurance` → `lookup_policy` → `create_task` → `draft_message` |
 | Incomplete referral | `create_task` → `draft_message` (no slot hold) |
@@ -112,6 +112,8 @@ Overlapping intents are resolved in fixed order (not first-keyword-wins):
 - Draft recipients prefer parent email from intake over fax sender (`resolveDraftRecipient`).
 - Incomplete fax referrals get clinic-facing draft copy (request missing fields from referring office).
 - `assertSafeDraft()` strips accidental clinical-advice phrasing from draft bodies before output.
+- **P1 slot policy:** `isSoonSlot()` only calls `hold_slot` when the opening is within three calendar days of `item.received_at`; otherwise front desk is tasked to call the family today with options (item_8: May 5 OT slot is not held for a same-day cancel).
+- **`task_ids`:** only `create_task` / `escalate` IDs — hold IDs appear in task notes and rationale, not in `task_ids`.
 - `tools_called[]` is copied unchanged from the trace via `getToolCallsForItem()`; summary counts use `buildBatchOutput()`.
 
 The trace file `.trace/tool-calls.jsonl` is the source of truth for tool audit; the validator cross-checks every `call_id` in `output.json`.
@@ -122,7 +124,7 @@ The trace file `.trace/tool-calls.jsonl` is the source of truth for tool audit; 
 
 **Extraction on freeform voicemails.** Regex handles the provided transcripts reasonably (including Spanish `soy …` caller names), but messy or atypical speech would benefit from structured LLM extraction with validation.
 
-**Insurance and slots.** Unknown payers map to `unknown` and block holds. Mock `find_slots` returns the earliest listed opening, which may not be same-day for P1 cancellations — staff must confirm before notifying families.
+**Insurance and slots.** Unknown payers map to `unknown` and block holds. For P1 same-day cancellations, `hold_slot` is skipped when the earliest opening is more than three days out; front desk is tasked to call the family instead (see item_8 in `output.json`).
 
 **Urgency calibration.** Default is P2. Over-escalation to P0/P1 is treated as a production failure mode; same-day signals require both cancel/reschedule language and a same-day time context.
 
@@ -146,5 +148,5 @@ The trace file `.trace/tool-calls.jsonl` is the source of truth for tool audit; 
 
 1. **LLM structured extraction for voicemails only** — JSON matching `ExtractedIntake`, merged with regex fallback (e.g. caller name on item_2).
 2. **Small eval harness** — golden expectations for the eight visible items (classification, urgency, key tools, no forbidden holds).
-3. **P1 slot policy** — skip `hold_slot` when the earliest opening is not same-day; task front desk to call family instead.
-4. **Tighter `task_ids`** — list only `create_task` IDs; reference hold IDs in task notes only.
+3. **Configurable P1 window** — make the three-day `isSoonSlot` threshold policy-driven via `lookup_policy` rather than hard-coded.
+4. **Broader ambiguous-message handling** — richer signals when referral, scheduling, and clinical language overlap in one thread.
