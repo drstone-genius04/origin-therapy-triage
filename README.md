@@ -148,5 +148,3 @@ The trace file `.trace/tool-calls.jsonl` is the source of truth for tool audit; 
 2. **Small eval harness** — golden expectations for the eight visible items (classification, urgency, key tools, no forbidden holds).
 3. **P1 slot policy** — skip `hold_slot` when the earliest opening is not same-day; task front desk to call family instead.
 4. **Tighter `task_ids`** — list only `create_task` IDs; reference hold IDs in task notes only.
-
-Already implemented in this submission: optional LLM safeguarding classifier with rules fallback ([`src/llm.ts`](src/llm.ts)), priority-based ambiguous classification ([`src/classify.ts`](src/classify.ts)), rule-based draft safety filter (`assertSafeDraft`), parent-aware draft routing, and `npm run check`.
