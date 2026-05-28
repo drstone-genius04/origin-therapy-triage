@@ -14,11 +14,7 @@ export function hasSafeguardingSignals(body: string): boolean {
   );
 }
 
-/**
- * Returns true when the message body and subject together indicate a same-day
- * cancellation or reschedule. Requires both a cancel/reschedule keyword AND
- * a same-day context keyword so routine reschedule requests are not elevated.
- */
+
 export function hasSameDayCancelSignals(body: string, subject: string): boolean {
   const combined = `${body} ${subject}`.toLowerCase();
   const hasCancelReschedule =
@@ -77,11 +73,18 @@ export function hasReferralSignals(
  *   6. Generic scheduling (no same-day urgency)
  *   7. Other
  */
-export function classify(item: InboxItem): Classification {
+/**
+ * @param safeguardingFlagged - pre-computed result from assessSafeguarding (rules + LLM).
+ *   Passing true forces safeguarding classification regardless of body keywords.
+ */
+export function classify(
+  item: InboxItem,
+  safeguardingFlagged = false,
+): Classification {
   const body = item.body.toLowerCase();
   const subject = item.subject.toLowerCase();
 
-  if (hasSafeguardingSignals(body)) return "safeguarding";
+  if (safeguardingFlagged || hasSafeguardingSignals(body)) return "safeguarding";
 
   if (hasSameDayCancelSignals(body, subject)) {
     // Promote to existing_patient_request when a named patient or DOB is

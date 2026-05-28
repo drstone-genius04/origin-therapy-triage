@@ -17,7 +17,8 @@ import {
   verify_insurance,
   withItemContext,
 } from "./tools.js";
-import { classify, prioritize } from "./classify.js";
+import { classify, hasSafeguardingSignals, prioritize } from "./classify.js";
+import { assessSafeguarding } from "./llm.js";
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
@@ -30,7 +31,10 @@ export async function runAgent(inbox: InboxItem[]): Promise<ItemOutput[]> {
 async function triageItem(item: InboxItem): Promise<ItemOutput> {
   return withItemContext(item.id, async () => {
     const body = item.body.toLowerCase();
-    const classification = classify(item);
+    // Run rules + optional LLM safeguarding check in parallel with other prep.
+    // The LLM call is outside src/tools.ts and does not appear in tools_called[].
+    const safeguarding = await assessSafeguarding(item, hasSafeguardingSignals(body));
+    const classification = classify(item, safeguarding.is_safeguarding);
     const urgency = prioritize(classification, body, item.subject);
     const intake = extractIntake(item);
     const missing = findMissing(classification, intake);
@@ -44,20 +48,30 @@ async function triageItem(item: InboxItem): Promise<ItemOutput> {
     if (urgency === "P0") {
       await lookup_policy({ topic: "safeguarding" });
 
+      // Use the LLM reason when it contributed; fall back to generic reason.
+      const escalationReason =
+        safeguarding.reason ||
+        "Disclosure suggesting possible harm or unsafe caregiving. Requires same-hour clinical lead review.";
+
       const esc = await escalate({
         item_id: item.id,
-        reason:
-          "Disclosure suggesting possible harm or unsafe caregiving in parent message. Requires same-hour clinical lead review.",
+        reason: escalationReason,
         severity: "P0",
       });
       escalationResult = { reason: esc.args.reason as string, severity: "P0" };
+
+      // Task notes distinguish LLM-only flags from keyword flags for staff context.
+      const taskNotes =
+        safeguarding.sources.includes("llm") &&
+        !safeguarding.sources.includes("rules")
+          ? `LLM safeguarding classifier flagged this message. Reason: ${safeguarding.reason} Review before any outbound contact.`
+          : "Parent message contains language suggesting possible harm or unsafe caregiving. Review before any outbound contact.";
 
       const task = await create_task({
         assignee: "clinical_lead",
         title: `P0 safeguarding review — ${item.sender}`,
         due: todayIso(),
-        notes:
-          "Parent message contains language suggesting possible harm or unsafe caregiving. Review before any outbound contact.",
+        notes: taskNotes,
       });
       taskIds.push(task.data.task_id);
 
@@ -70,6 +84,11 @@ async function triageItem(item: InboxItem): Promise<ItemOutput> {
       });
       draftReply = draft.args.body as string;
 
+      // Build rationale that transparently records which detectors fired.
+      const rationalePrefix = safeguarding.sources.includes("llm")
+        ? `Safeguarding flagged by LLM classifier: ${safeguarding.reason}`
+        : "Message contains language suggesting possible harm or unsafe caregiving (keyword rules).";
+
       return buildOutput(
         item,
         classification,
@@ -80,7 +99,7 @@ async function triageItem(item: InboxItem): Promise<ItemOutput> {
         escalationResult,
         draftReply,
         "Clinical lead has been alerted for same-hour review. No outbound message may be sent until staff review.",
-        "Message contains language suggesting possible harm or unsafe caregiving. Classified P0 per safeguarding policy. Escalated to clinical lead and created same-day review task. Any scheduling or evaluation request is deferred until safeguarding review completes.",
+        `${rationalePrefix} Classified P0 per safeguarding policy. Escalated to clinical lead and created same-day review task. Any scheduling or evaluation request is deferred until safeguarding review completes.`,
       );
     }
 
